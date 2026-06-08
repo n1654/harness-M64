@@ -1,0 +1,16 @@
+services:
+  harness:
+    build: .
+    container_name: harness
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:8080:8080"   # UI
+      - "127.0.0.1:9090:9090"   # Monitoring
+      - "127.0.0.1:7000:7000"   # Control shell
+    volumes:
+      - ./memory:/app/memory
+      - ./tools:/app/tools
+      - ./state:/app/state
+      # For mTLS auth or custom CA bundle:
+      # - ./certs:/app/certs:ro

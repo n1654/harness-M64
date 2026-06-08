@@ -1,0 +1,20 @@
+@startuml harness-context
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Context.puml
+
+LAYOUT_WITH_LEGEND()
+title Harness M64 -- System Context
+
+Person(operator, "Operator", "Chats with the agent, observes metrics, sends ops commands")
+Person_Ext(ops, "Monitoring / Ops user", "Scrapes Prometheus metrics, watches the live process map")
+
+System(harness, "Harness M64", "Self-driving LLM agent runtime: agent loop, memory layers, tools, three operational surfaces (UI / monitoring / control)")
+
+System_Ext(gigachat, "GigaChat API", "External LLM provider: OAuth token + /chat/completions")
+
+Rel(operator, harness, "Chat with agent (Web UI or CLI)")
+Rel(operator, harness, "Ops commands: start / stop / emergency_stop / status")
+Rel(ops, harness, "Scrape /metrics; view /process-map")
+Rel(harness, gigachat, "OAuth + chat completions", "HTTPS")
+
+SHOW_LEGEND()
+@enduml

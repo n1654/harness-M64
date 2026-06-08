@@ -1,0 +1,55 @@
+@startuml harness-container
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+title Harness M64 -- Containers (single Docker, three TCP ports)
+
+Person(operator, "Operator")
+Person_Ext(ops, "Monitoring / Ops")
+System_Ext(gigachat, "GigaChat API")
+Container_Ext(extcli, "harness-cli (host)", "Python script", "Optional: external CLI that connects to control TCP from outside the container")
+
+System_Boundary(harness, "Harness M64 (Docker container)") {
+
+  Container(ui, "UI server", "HTTP :8080 -- HTMX + SSE", "Web client: chat, recent episodes. Thin wrapper over Core API. Removable.")
+  Container(monitor, "Monitoring server", "HTTP :9090", "/metrics (Prometheus), /process-map (Mermaid graph, rendered in browser)")
+  Container(control, "Control shell", "TCP :7000 -- line-based, Cisco-style", "Interactive shell: show status / tools / sessions, restart, stop, emergency stop")
+
+  Container(core, "Core API", "Python facade -- in-process", "Public verbs: submit_prompt, stream_response, get_status, list_tools, stop, ... The only contract between clients and the agent")
+
+  Container(agent, "Agent loop", "Python", "Implements Core API. Reads memory, calls LLM, executes tools, emits events. Stoppable.")
+  Container(llm, "LLM adapter", "Python -- GigaChat client", "OAuth token cache + chat completions. Behind LLMClient interface; swappable")
+  Container(tools, "Tool registry", "Python -- file plugins", "Discovers tools/*.py via get_tools(); each tool emits start/end events")
+  Container(bus, "Event bus", "in-process pub/sub", "tool_call_*, llm_usage, agent_round, errors. Single producer -> many consumers")
+
+  ContainerDb(memory, "Memory store", "Filesystem -- memory/", "constitution.md, system.md, scratchpad.md, knowledge/*.md, episodes/*.jsonl")
+  ContainerDb(state, "Runtime state", "JSON files (later: SQLite)", "Sessions, metric snapshots")
+}
+
+Rel(operator, ui,      "Chat", "HTTP/SSE")
+Rel(operator, control, "nc localhost 7000 / docker exec", "TCP")
+Rel(extcli, control,   "Lifecycle commands", "TCP")
+Rel(ops, monitor,      "Scrape / view", "HTTP")
+
+Rel(ui,      core, "calls (in-process)")
+Rel(monitor, core, "calls (in-process)")
+Rel(control, core, "calls (in-process)")
+
+Rel(core, agent, "owns / implements")
+
+Rel(agent, llm,    "chat(messages, tools)")
+Rel(llm, gigachat, "OAuth + /api/v1/chat/completions", "HTTPS")
+
+Rel(agent, tools,  "execute(name, args)")
+Rel(agent, memory, "Read layers; write scratchpad / knowledge / episodes")
+Rel(agent, state,  "Persist sessions, snapshots")
+
+Rel(agent, bus, "emit agent_round / error")
+Rel(tools, bus, "emit tool_call_start / end")
+Rel(llm, bus,   "emit llm_usage")
+
+Rel(monitor, bus,   "subscribe (all events)")
+Rel(monitor, state, "read historical snapshots")
+
+SHOW_LEGEND()
+@enduml
