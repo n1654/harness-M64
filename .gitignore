@@ -217,3 +217,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 out/
+
+# Harness — runtime artifacts and dev scripts (not committed)
+/scripts/
+/memory/scratchpad.md
+/memory/knowledge/
+/memory/episodes/
+/state/

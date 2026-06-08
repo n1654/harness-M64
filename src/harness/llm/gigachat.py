@@ -75,7 +75,13 @@ class GigaChatClient(LLMClient):
         chat_url: str = CHAT_URL_DEFAULT,
         timeout: float = 120.0,
         extra_headers: Optional[Mapping[str, str]] = None,
+        tool_format: str = "functions",
     ) -> None:
+        if tool_format not in ("functions", "tools"):
+            raise ValueError(
+                f"unknown tool_format={tool_format!r}; expected 'functions' (legacy GigaChat) "
+                f"or 'tools' (OpenAI-compatible proxies)"
+            )
         if auth_mode not in ("credentials", "mtls"):
             raise ValueError(
                 f"unknown auth_mode={auth_mode!r}; expected 'credentials' or 'mtls'"
@@ -99,6 +105,7 @@ class GigaChatClient(LLMClient):
         self._timeout = timeout
 
         self._extra_headers: Dict[str, str] = {str(k): str(v) for k, v in (extra_headers or {}).items()}
+        self._tool_format = tool_format
 
         self._token: Optional[_Token] = None
         self._token_lock = asyncio.Lock()
@@ -108,6 +115,7 @@ class GigaChatClient(LLMClient):
             log.warning("TLS verification DISABLED (GIGACHAT_TLS_INSECURE=1)")
         if self._extra_headers:
             log.info("extra HTTP headers: %s", sorted(self._extra_headers))
+        log.info("tool wire format: %s", self._tool_format)
 
     # ---- construction from env ----
 
@@ -142,6 +150,9 @@ class GigaChatClient(LLMClient):
             kwargs["timeout"] = float(os.environ.get("GIGACHAT_TIMEOUT", "120"))
         except ValueError:
             pass
+
+        tf = (os.environ.get("GIGACHAT_TOOL_FORMAT") or "functions").strip().lower()
+        kwargs["tool_format"] = tf
 
         raw_headers = (os.environ.get("GIGACHAT_HEADERS") or "").strip()
         if raw_headers:
@@ -261,29 +272,82 @@ class GigaChatClient(LLMClient):
     ) -> CompletionResult:
         token = await self._ensure_token()
 
+        ser_msg = _serialize_message_openai if self._tool_format == "tools" else _serialize_message
+
+        ser_msgs = [ser_msg(m) for m in messages]
+        # GigaChat v1: detect whether the conversation already entered a
+        # function-calling chain (any function-result message present).
+        has_function_result = (
+            self._tool_format == "functions"
+            and any(m.get("role") == "function" for m in ser_msgs)
+        )
+
         payload: Dict[str, Any] = {
             "model": model or self._default_model,
-            "messages": [_serialize_message(m) for m in messages],
+            "messages": ser_msgs,
         }
         if tools:
-            payload["tools"] = tools
+            if self._tool_format == "tools":
+                # OpenAI-compatible proxies expect this shape on every turn.
+                payload["tools"] = [_to_openai_tool(t) for t in tools]
+                payload["tool_choice"] = "auto"
+            elif not has_function_result:
+                # GigaChat v1 quirk: `functions[]` + `function_call` are only
+                # valid on the FIRST request of a function-calling chain.
+                # Re-sending them together with an assistant-function_call +
+                # function-result pair in `messages[]` triggers 422
+                # "INVALID_PARAMS: functions ... should only appear in user,
+                # function messages or random role messages".
+                #
+                # On follow-up turns we must keep BOTH the assistant turn AND
+                # the function-result in `messages[]` (otherwise the server
+                # complains: "every assistant function call must have a result
+                # in history") -- but omit the top-level `functions[]` /
+                # `function_call`. The chain is resumed via `functions_state_id`
+                # already echoed on the messages themselves.
+                payload["functions"] = [_to_giga_function(t) for t in tools]
+                payload["function_call"] = "auto"
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
 
         headers: Dict[str, str] = dict(self._extra_headers)
         headers.update({
             "Authorization": f"Bearer {token}",
-            "RqUID": uuid.uuid4().hex,
+            "RqUID": str(uuid.uuid4()),
             "Content-Type": "application/json",
             "Accept": "application/json",
         })
 
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("chat payload: %s", json.dumps(payload, ensure_ascii=False)[:2000])
+
         http = await self._get_http()
         resp = await http.post(self._chat_url, headers=headers, json=payload)
         if resp.status_code >= 400:
+            # Dump full payload to a file (overwrite each time), so the operator
+            # can inspect even when it's bigger than any sane log line.
+            dump_path = "/tmp/harness_last_failed_payload.json"
+            try:
+                import pathlib as _pl
+                _pl.Path(dump_path).write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8",
+                )
+            except Exception:    # noqa: BLE001
+                dump_path = "(failed to write dump)"
+
+            # Also show the TAIL of the payload (which is where the offending
+            # function_call / function-result messages live).
+            payload_str = json.dumps(payload, ensure_ascii=False)
+            head = payload_str[:400]
+            tail = payload_str[-1200:] if len(payload_str) > 400 else ""
+            preview = head + ("\n  ...[middle truncated]...\n" + tail if tail else "")
+
             raise RuntimeError(
-                f"GigaChat chat request failed: HTTP {resp.status_code} from {self._chat_url}. "
-                f"Response body: {resp.text[:1000]!r}"
+                f"GigaChat chat request failed: HTTP {resp.status_code} from {self._chat_url}.\n"
+                f"  tool_format={self._tool_format!r}\n"
+                f"  response body: {resp.text[:1000]!r}\n"
+                f"  full payload dumped to: {dump_path}\n"
+                f"  payload (head + tail): {preview}"
             )
         data = resp.json()
 
@@ -300,27 +364,156 @@ def _env_bool(name: str, *, default: bool) -> bool:
 
 
 def _serialize_message(m: Message) -> Dict[str, Any]:
-    d: Dict[str, Any] = {"role": m.role}
-    if m.content is not None:
-        d["content"] = m.content
+    """Translate our internal `Message` to GigaChat's wire format.
+
+    Mapping vs OpenAI-compat shape:
+        * tool result          role="tool"     -> role="function"   (name + content, no id)
+        * assistant tool_calls -> assistant + function_call (first call only -- GigaChat
+                                  doesn't support parallel calls per turn)
+        * everything else      -> identical
+
+    The `content` field is ALWAYS present (null when there is no text). Several
+    GigaChat-compatible proxies reject messages that omit it.
+    """
+    if m.role == "tool":
+        # Function-result: pair with the preceding assistant turn by name.
+        # We intentionally do NOT echo `functions_state_id` -- having it on
+        # both the assistant and the function message confuses the validator.
+        #
+        # GigaChat v1 also REQUIRES `content` to be a JSON-parseable string
+        # ("invalid function result for function X json string `...`,
+        # JSON parse error..."). Plain text like "2026-06-08 12:00 UTC" fails
+        # at the first non-numeric character. We wrap via json.dumps so any
+        # tool return becomes a valid JSON string literal; tool returns that
+        # already parse as JSON (numbers, objects) pass through.
+        raw = m.content or ""
+        try:
+            json.loads(raw)
+            wrapped = raw
+        except (ValueError, TypeError):
+            wrapped = json.dumps(raw, ensure_ascii=False)
+        return {
+            "role": "function",
+            "name": m.name or "",
+            "content": wrapped,
+        }
+
+    if m.tool_calls:
+        first = m.tool_calls[0] or {}
+        fn = first.get("function") or {}
+        raw_args = fn.get("arguments", "{}")
+        # GigaChat v1 (developers.sber.ru) expects `arguments` as a JSON OBJECT,
+        # not a string (the latter is the OpenAI-legacy convention). Parse so we
+        # serialize as an object.
+        if isinstance(raw_args, str):
+            try:
+                args_obj: Any = json.loads(raw_args)
+                if not isinstance(args_obj, dict):
+                    args_obj = {}
+            except (ValueError, TypeError):
+                args_obj = {}
+        elif isinstance(raw_args, dict):
+            args_obj = raw_args
+        else:
+            args_obj = {}
+        # The Sber wire convention uses content="" (not null) on assistant turns
+        # that carry a function_call. Match what the API itself emits.
+        return {
+            "role": m.role,
+            "content": m.content if m.content is not None else "",
+            "function_call": {
+                "name": fn.get("name", ""),
+                "arguments": args_obj,
+            },
+        }
+
+    return {
+        "role": m.role,
+        "content": m.content,        # explicit null is OK and safer than omission
+        **({"name": m.name} if m.name else {}),
+    }
+
+
+def _serialize_message_openai(m: Message) -> Dict[str, Any]:
+    """OpenAI-compatible wire shape. Used when tool_format='tools'.
+
+    Always emits an explicit `content` field (null when empty) -- some proxies
+    reject messages without it.
+    """
+    if m.role == "tool":
+        out: Dict[str, Any] = {"role": "tool", "content": m.content or ""}
+        if m.tool_call_id:
+            out["tool_call_id"] = m.tool_call_id
+        if m.name:
+            out["name"] = m.name
+        return out
+    d: Dict[str, Any] = {"role": m.role, "content": m.content}
     if m.tool_calls:
         d["tool_calls"] = m.tool_calls
     if m.name:
         d["name"] = m.name
-    if m.tool_call_id:
-        d["tool_call_id"] = m.tool_call_id
     return d
 
 
+def _to_openai_tool(t: Dict[str, Any]) -> Dict[str, Any]:
+    """Pass through OpenAI-shape tools verbatim; wrap a bare function dict if needed."""
+    if t.get("type") == "function" and "function" in t:
+        return t
+    return {"type": "function", "function": t}
+
+
+def _to_giga_function(t: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate an OpenAI-shape tool entry (`{type: "function", function: {...}}`)
+    to GigaChat's `functions[]` shape. Passes through GigaChat extensions when
+    present (`few_shot_examples`, `return_parameters`)."""
+    fn = t.get("function") if t.get("type") == "function" else t
+    out: Dict[str, Any] = {
+        "name": fn["name"],
+        "description": fn.get("description", ""),
+        "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
+    }
+    if "few_shot_examples" in fn:
+        out["few_shot_examples"] = fn["few_shot_examples"]
+    if "return_parameters" in fn:
+        out["return_parameters"] = fn["return_parameters"]
+    return out
+
+
 def _parse_response(data: Dict[str, Any]) -> CompletionResult:
+    """Normalise GigaChat's `function_call` back to our internal `tool_calls`
+    shape so callers don't see the legacy schema."""
     choices = data.get("choices") or []
     msg_data: Dict[str, Any] = (choices[0].get("message") if choices else {}) or {}
     usage_data: Dict[str, Any] = data.get("usage") or {}
 
+    tool_calls: List[Dict[str, Any]] = list(msg_data.get("tool_calls") or [])
+    if not tool_calls:
+        fc = msg_data.get("function_call")
+        if isinstance(fc, dict) and fc.get("name"):
+            args = fc.get("arguments", "{}")
+            if not isinstance(args, str):
+                # GigaChat returns parsed dict -- keep as JSON string in the internal
+                # contract; the giga serializer parses it back to object on outgoing.
+                args = json.dumps(args, ensure_ascii=False)
+            tool_calls = [{
+                "id": "call_" + uuid.uuid4().hex[:12],
+                "type": "function",
+                "function": {"name": fc["name"], "arguments": args},
+            }]
+
+    # GigaChat-specific: opaque state token tying together one function-call chain.
+    # We propagate it back on subsequent turns so the server can correlate the
+    # function-result with the original call.
+    provider_meta: Optional[Dict[str, Any]] = None
+    state_id = msg_data.get("functions_state_id")
+    if state_id:
+        provider_meta = {"functions_state_id": state_id}
+
     message = Message(
         role=msg_data.get("role") or "assistant",
         content=msg_data.get("content"),
-        tool_calls=msg_data.get("tool_calls") or [],
+        tool_calls=tool_calls,
+        provider_meta=provider_meta,
     )
     usage = Usage(
         prompt_tokens=int(usage_data.get("prompt_tokens") or 0),

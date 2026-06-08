@@ -9,22 +9,28 @@ and it still functions if you call `submit_prompt` programmatically.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import pathlib
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Dict, List, Optional
+from typing import AsyncIterator, Dict, List, Optional, Set
+
+log = logging.getLogger("harness.core")
+
+
+_END_OF_STREAM = object()    # sentinel pushed to the chunk queue when a session is done
 
 
 @dataclass
 class Session:
-    """One prompt → response interaction."""
+    """One prompt -> response interaction."""
 
     id: str
     prompt: str
     created_at: float = field(default_factory=time.time)
-    status: str = "pending"   # pending | running | done | failed | cancelled
+    status: str = "pending"   # pending | running | done | failed
     response_chunks: asyncio.Queue = field(default_factory=asyncio.Queue)
 
 
@@ -42,7 +48,7 @@ class Status:
 class CoreAPI:
     """Facade — call these verbs from any surface.
 
-    Lifecycle: `from_env()` → `await start()` → use → `await stop()`.
+    Lifecycle: `from_env()` -> `await start()` -> use -> `await stop()`.
     `run_forever()` keeps the agent loop alive after `start()` returns.
     """
 
@@ -62,12 +68,12 @@ class CoreAPI:
         self._state_dir = state_dir
         self._started_at: Optional[float] = None
         self._sessions: Dict[str, Session] = {}
+        self._session_tasks: Set[asyncio.Task] = set()
         self._bus = EventBus()
-        self._agent = None    # type: ignore[assignment]    # lazy: set in start()
+        self._agent = None    # set in start()
 
     @classmethod
     def from_env(cls) -> "CoreAPI":
-        """Read HARNESS_* env vars and build a Core."""
         return cls(
             memory_dir=pathlib.Path(os.environ.get("HARNESS_MEMORY_DIR", "memory")),
             tools_dir=pathlib.Path(os.environ.get("HARNESS_TOOLS_DIR", "tools")),
@@ -77,7 +83,6 @@ class CoreAPI:
     # ---- lifecycle ----
 
     async def start(self) -> None:
-        """Initialise tools, memory, LLM client, agent loop. Idempotent."""
         from harness.agent import Agent
 
         if self._started_at is not None:
@@ -92,13 +97,15 @@ class CoreAPI:
         await self._agent.start()
 
     async def run_forever(self) -> None:
-        """Block until shutdown is requested."""
-        # TODO: replace with a real shutdown event.
+        # Sleeps forever; explicit shutdown signal will be added with control.stop wiring.
         while True:
             await asyncio.sleep(3600)
 
     async def stop(self, *, emergency: bool = False) -> None:
-        """Graceful shutdown (or `emergency=True` to abort running sessions)."""
+        # Cancel running sessions on emergency.
+        if emergency:
+            for t in list(self._session_tasks):
+                t.cancel()
         if self._agent is not None:
             await self._agent.stop(emergency=emergency)
 
@@ -106,12 +113,40 @@ class CoreAPI:
 
     async def submit_prompt(self, prompt: str) -> str:
         """Enqueue a prompt. Returns `session_id` for streaming the response."""
+        if self._agent is None:
+            raise RuntimeError("CoreAPI.start() not called yet")
+
         sid = uuid.uuid4().hex
         session = Session(id=sid, prompt=prompt)
         self._sessions[sid] = session
-        # TODO: hand off to agent loop.
+
         await self._bus.publish("prompt_submitted", session_id=sid, prompt=prompt)
+
+        task = asyncio.create_task(self._run_session(session), name=f"session-{sid[:8]}")
+        self._session_tasks.add(task)
+        task.add_done_callback(self._session_tasks.discard)
+
         return sid
+
+    async def _run_session(self, session: Session) -> None:
+        """Drive one session: agent.handle -> push chunks -> close stream."""
+        assert self._agent is not None
+        session.status = "running"
+        try:
+            content = await self._agent.handle(session.id, session.prompt)
+            await session.response_chunks.put(content or "(empty response)")
+            session.status = "done"
+        except asyncio.CancelledError:
+            session.status = "failed"
+            await session.response_chunks.put("⚠️ session cancelled")
+            raise
+        except Exception as e:    # noqa: BLE001
+            log.exception("session %s failed", session.id)
+            session.status = "failed"
+            await session.response_chunks.put(f"⚠️ error: {type(e).__name__}: {e}")
+        finally:
+            # Sentinel — signals stream_response() to return.
+            await session.response_chunks.put(_END_OF_STREAM)
 
     async def stream_response(self, session_id: str) -> AsyncIterator[str]:
         """Yield response chunks for a given session until the session is done."""
@@ -120,30 +155,32 @@ class CoreAPI:
             return
         while True:
             chunk = await session.response_chunks.get()
-            if chunk is None:    # sentinel — end of stream
+            if chunk is _END_OF_STREAM:
                 return
-            yield chunk
+            yield chunk    # type: ignore[misc]
 
     def get_status(self) -> Status:
+        tools_loaded = 0
+        if self._agent is not None and self._agent.tools is not None:
+            tools_loaded = len(self._agent.tools.names())
         return Status(
             uptime_sec=time.time() - (self._started_at or time.time()),
-            running=self._started_at is not None,
+            running=self._started_at is not None and self._agent is not None and self._agent.running,
             sessions_total=len(self._sessions),
             sessions_active=sum(1 for s in self._sessions.values() if s.status == "running"),
-            tools_loaded=0,    # TODO: ask tool registry
+            tools_loaded=tools_loaded,
         )
 
     def list_tools(self) -> List[str]:
-        """Names of all loaded tools."""
-        return []   # TODO
+        if self._agent is None or self._agent.tools is None:
+            return []
+        return self._agent.tools.names()
 
     def list_sessions(self, *, limit: int = 20) -> List[Session]:
-        """Most recent sessions."""
         return sorted(self._sessions.values(), key=lambda s: s.created_at, reverse=True)[:limit]
 
     # ---- internals exposed to monitor ----
 
     @property
-    def bus(self):     # noqa: ANN201    # type defined in bus.py
-        """Event bus reference for the monitor server to subscribe to."""
+    def bus(self):    # noqa: ANN201
         return self._bus

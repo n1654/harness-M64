@@ -23,6 +23,16 @@ async def _amain() -> None:
     core = CoreAPI.from_env()
     await core.start()
 
+    # Visibility: log every bus event so operator can see the flow in `docker compose logs`.
+    bus_log = logging.getLogger("harness.bus")
+
+    async def _log_event(evt) -> None:    # noqa: ANN001
+        # Trim noisy fields (e.g. full raw HTTP responses) before logging.
+        compact = {k: v for k, v in evt.data.items() if k not in ("raw", "prompt")}
+        bus_log.info("%s %s", evt.kind, compact)
+
+    await core.bus.subscribe(_log_event)
+
     ui_port = int(os.environ.get("HARNESS_UI_PORT", "8080"))
     mon_port = int(os.environ.get("HARNESS_MONITOR_PORT", "9090"))
     ctl_port = int(os.environ.get("HARNESS_CONTROL_PORT", "7000"))

@@ -11,13 +11,19 @@ from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
 @dataclass
 class Message:
-    """Chat message in the OpenAI-compatible shape."""
+    """Chat message in the OpenAI-compatible shape.
+
+    `provider_meta` is an escape hatch for provider-specific fields that don't
+    fit OpenAI's schema -- e.g. GigaChat's `functions_state_id`. The agent loop
+    treats it opaquely; only the LLM adapter reads/writes it.
+    """
 
     role: str    # "system" | "user" | "assistant" | "tool"
     content: Optional[str] = None
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     name: Optional[str] = None
     tool_call_id: Optional[str] = None
+    provider_meta: Optional[Dict[str, Any]] = None
 
 
 @dataclass
