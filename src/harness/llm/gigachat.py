@@ -76,6 +76,7 @@ class GigaChatClient(LLMClient):
         timeout: float = 120.0,
         extra_headers: Optional[Mapping[str, str]] = None,
         tool_format: str = "functions",
+        profanity_check: bool = True,
     ) -> None:
         if tool_format not in ("functions", "tools"):
             raise ValueError(
@@ -106,6 +107,7 @@ class GigaChatClient(LLMClient):
 
         self._extra_headers: Dict[str, str] = {str(k): str(v) for k, v in (extra_headers or {}).items()}
         self._tool_format = tool_format
+        self._profanity_check = bool(profanity_check)
 
         self._token: Optional[_Token] = None
         self._token_lock = asyncio.Lock()
@@ -115,7 +117,8 @@ class GigaChatClient(LLMClient):
             log.warning("TLS verification DISABLED (GIGACHAT_TLS_INSECURE=1)")
         if self._extra_headers:
             log.info("extra HTTP headers: %s", sorted(self._extra_headers))
-        log.info("tool wire format: %s", self._tool_format)
+        log.info("tool wire format: %s; profanity_check=%s",
+                 self._tool_format, self._profanity_check)
 
     # ---- construction from env ----
 
@@ -153,6 +156,8 @@ class GigaChatClient(LLMClient):
 
         tf = (os.environ.get("GIGACHAT_TOOL_FORMAT") or "functions").strip().lower()
         kwargs["tool_format"] = tf
+
+        kwargs["profanity_check"] = _env_bool("GIGACHAT_PROFANITY_CHECK", default=True)
 
         raw_headers = (os.environ.get("GIGACHAT_HEADERS") or "").strip()
         if raw_headers:
@@ -285,6 +290,7 @@ class GigaChatClient(LLMClient):
         payload: Dict[str, Any] = {
             "model": model or self._default_model,
             "messages": ser_msgs,
+            "profanity_check": self._profanity_check,
         }
         if tools:
             if self._tool_format == "tools":

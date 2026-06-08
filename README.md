@@ -84,6 +84,30 @@ TLS verification (orthogonal to auth mode):
 
 For mTLS, mount your certs into the container — uncomment the `./certs:/app/certs:ro` volume in `docker-compose.yml` and point the env vars there.
 
+Other request-level options:
+
+| Env | Default | Effect |
+|---|---|---|
+| `GIGACHAT_PROFANITY_CHECK` | `true` | Server-side profanity filter (sent on every chat request). Set to `false` to disable. |
+
+Wire-format quirks of GigaChat function-calling (vs OpenAI tools) are documented separately in [docs/gigachat-functions.md](docs/gigachat-functions.md).
+
+## Runtime behavior
+
+**Chat thread (multi-turn memory).** Every user prompt and final assistant reply is appended to `state/chat.jsonl` and to the in-memory thread. On start, the file is loaded back, so the model keeps full conversational context across container restarts. Tool calls happening *inside* one round are NOT logged here — only the user-visible turns. The UI fetches `/api/chat` on load and renders the full thread.
+
+**Persistent task queue.** Each in-flight prompt is mirrored as `state/queue/<session_id>.json` with a snapshot of the prior chat history. If the container dies mid-LLM-call, the next start scans the queue and re-runs the unfinished prompts sequentially in the background. The user message stays in the chat thread; the assistant reply lands as soon as the restored task finishes. Failed/cancelled sessions drop their queue entry to avoid restart-crash loops (one chance only).
+
+**Factory reset** — via the [control shell](#three-tcp-interfaces-single-container) on port 7000:
+
+```
+harness> reset chat         # wipe only the chat thread (state/chat.jsonl)
+harness> reset all          # wipe chat + scratchpad + knowledge + episodes + state
+harness> show queue         # peek at pending in-flight prompts
+```
+
+`reset all` never touches `memory/level_*.md` or operator-supplied `tools/` — only agent-writable areas.
+
 ## Roadmap
 
 1. **Architecture** ← we are here. C4 diagrams in [docs/architecture/](docs/architecture/).

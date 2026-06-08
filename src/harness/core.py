@@ -93,6 +93,10 @@ class CoreAPI:
         self._state_dir.mkdir(parents=True, exist_ok=True)
         self._chat_log_path = self._state_dir / "chat.jsonl"
 
+        # Persistent task queue (survives restarts).
+        self._queue_dir = self._state_dir / "queue"
+        self._queue_dir.mkdir(parents=True, exist_ok=True)
+
     @classmethod
     def from_env(cls) -> "CoreAPI":
         return cls(
@@ -118,6 +122,9 @@ class CoreAPI:
             state_dir=self._state_dir,
         )
         await self._agent.start()
+
+        # Respawn any prompts that were in-flight when the process last died.
+        await self._restore_pending_tasks()
 
     async def run_forever(self) -> None:
         # Sleeps forever; explicit shutdown signal will be added with control.stop wiring.
@@ -145,12 +152,14 @@ class CoreAPI:
 
         # Snapshot the chat history BEFORE adding the new user turn -- the agent
         # gets the prior conversation as context, plus the prompt as the user
-        # message. We append the user turn and persist it under the same lock.
+        # message. We append the user turn, persist it, AND write a queue entry
+        # for restart-recovery under the same lock.
         async with self._chat_lock:
             prior_history = list(self._chat_history)
             user_msg = ChatMessage(role="user", content=prompt)
             self._chat_history.append(user_msg)
             self._append_chat_log(user_msg)
+            self._write_queue_entry(session, prior_history)
 
         await self._bus.publish("prompt_submitted", session_id=sid, prompt=prompt)
 
@@ -175,16 +184,21 @@ class CoreAPI:
                 asst_msg = ChatMessage(role="assistant", content=content)
                 self._chat_history.append(asst_msg)
                 self._append_chat_log(asst_msg)
+                self._delete_queue_entry(session.id)
 
             session.status = "done"
         except asyncio.CancelledError:
             session.status = "failed"
             await session.response_chunks.put("⚠️ session cancelled")
+            self._delete_queue_entry(session.id)    # don't auto-retry cancellations
             raise
         except Exception as e:    # noqa: BLE001
             log.exception("session %s failed", session.id)
             session.status = "failed"
             await session.response_chunks.put(f"⚠️ error: {type(e).__name__}: {e}")
+            # One restart-attempt was already this run -- drop the queue entry
+            # so a buggy prompt cannot crash-restore-loop forever.
+            self._delete_queue_entry(session.id)
         finally:
             # Sentinel — signals stream_response() to return.
             await session.response_chunks.put(_END_OF_STREAM)
@@ -274,6 +288,8 @@ class CoreAPI:
                     elif entry.is_dir():
                         shutil.rmtree(entry)
                         removed["paths"].append(str(entry) + "/")
+            # Queue dir must still exist after the wipe (new prompts need it).
+            self._queue_dir.mkdir(parents=True, exist_ok=True)
 
         await self._bus.publish("factory_reset", scope=scope, removed_paths=removed["paths"])
         log.info("factory reset (scope=%s): removed %s", scope, removed["paths"])
@@ -318,3 +334,118 @@ class CoreAPI:
                 ) + "\n")
         except OSError:
             log.warning("failed to append to chat log %s", self._chat_log_path, exc_info=True)
+
+    # ---- queue persistence ----
+
+    def _queue_path(self, session_id: str) -> pathlib.Path:
+        return self._queue_dir / f"{session_id}.json"
+
+    def _write_queue_entry(self, session: Session, prior_history: List[ChatMessage]) -> None:
+        """Persist a pending task. Removed when the session finishes (any outcome)."""
+        path = self._queue_path(session.id)
+        data = {
+            "session_id": session.id,
+            "prompt": session.prompt,
+            "created_at": session.created_at,
+            "prior_history": [
+                {"role": m.role, "content": m.content, "ts": m.ts} for m in prior_history
+            ],
+        }
+        try:
+            path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            log.warning("failed to write queue entry %s", path, exc_info=True)
+
+    def _delete_queue_entry(self, session_id: str) -> None:
+        try:
+            self._queue_path(session_id).unlink(missing_ok=True)
+        except OSError:
+            log.debug("failed to delete queue entry for %s", session_id, exc_info=True)
+
+    def list_pending_queue(self) -> List[Dict[str, Any]]:
+        """Snapshot of pending queue entries on disk (most-recent first)."""
+        entries: List[Dict[str, Any]] = []
+        if not self._queue_dir.is_dir():
+            return entries
+        for path in self._queue_dir.glob("*.json"):
+            try:
+                d = json.loads(path.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                continue
+            entries.append({
+                "session_id": str(d.get("session_id") or path.stem),
+                "prompt": str(d.get("prompt") or ""),
+                "created_at": float(d.get("created_at") or 0.0),
+                "history_len": len(d.get("prior_history") or []),
+            })
+        entries.sort(key=lambda e: e["created_at"], reverse=True)
+        return entries
+
+    async def _restore_pending_tasks(self) -> None:
+        """On start, respawn any tasks left behind by the previous process.
+
+        Sequential to keep chat-thread ordering deterministic across restarts.
+        Runs in the background so `start()` doesn't block on a backlog.
+        """
+        if not self._queue_dir.is_dir():
+            return
+        paths = sorted(self._queue_dir.glob("*.json"))
+        if not paths:
+            return
+
+        restored: List[Dict[str, Any]] = []
+        for path in paths:
+            try:
+                d = json.loads(path.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                log.warning("dropping malformed queue entry %s", path, exc_info=True)
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                continue
+            sid = str(d.get("session_id") or "")
+            prompt = str(d.get("prompt") or "")
+            if not sid or not prompt:
+                log.warning("dropping queue entry with empty session_id/prompt: %s", path)
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                continue
+            restored.append({
+                "session_id": sid,
+                "prompt": prompt,
+                "created_at": float(d.get("created_at") or time.time()),
+                "prior_history": [
+                    ChatMessage(
+                        role=str(p.get("role") or "user"),
+                        content=str(p.get("content") or ""),
+                        ts=float(p.get("ts") or time.time()),
+                    )
+                    for p in (d.get("prior_history") or [])
+                ],
+            })
+
+        if not restored:
+            return
+
+        restored.sort(key=lambda x: x["created_at"])
+        log.info("restoring %d pending session(s) from queue", len(restored))
+
+        async def _replay() -> None:
+            for r in restored:
+                session = Session(id=r["session_id"], prompt=r["prompt"], created_at=r["created_at"])
+                self._sessions[session.id] = session
+                await self._bus.publish(
+                    "session_restored", session_id=session.id, prompt=session.prompt,
+                )
+                # Sequential -- chat-thread ordering depends on completion order.
+                try:
+                    await self._run_session(session, r["prior_history"])
+                except Exception:    # noqa: BLE001
+                    log.exception("restored session %s crashed", session.id)
+
+        task = asyncio.create_task(_replay(), name="restore-queue")
+        self._session_tasks.add(task)
+        task.add_done_callback(self._session_tasks.discard)

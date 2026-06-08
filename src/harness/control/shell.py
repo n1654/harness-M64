@@ -83,6 +83,17 @@ async def _show_sessions(s: _Session) -> None:
         await s.line(f"  {r.id[:8]}  {r.status:10s}  {r.prompt[:60]}")
 
 
+async def _show_queue(s: _Session) -> None:
+    rows = s.core.list_pending_queue()
+    if not rows:
+        await s.line("(queue empty)")
+        return
+    for r in rows:
+        await s.line(
+            f"  {r['session_id'][:8]}  hist={r['history_len']:3d}  {r['prompt'][:60]}"
+        )
+
+
 async def _show_config(s: _Session) -> None:
     # Operator-safe view; redact secrets.
     import os
@@ -129,7 +140,7 @@ async def _reset_all(s: _Session) -> None:
 
 async def _help(s: _Session) -> None:
     await s.line("commands:")
-    await s.line("  show {status,version,tools,sessions,config}")
+    await s.line("  show {status,version,tools,sessions,queue,config}")
     await s.line("  restart")
     await s.line("  stop")
     await s.line("  emergency stop")
@@ -145,6 +156,7 @@ _TREE: Dict[str, object] = {
         "version": _show_version,
         "tools": _show_tools,
         "sessions": _show_sessions,
+        "queue": _show_queue,
         "config": _show_config,
     },
     "restart": _restart,
