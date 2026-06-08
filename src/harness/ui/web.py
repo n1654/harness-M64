@@ -41,7 +41,10 @@ _INDEX_HTML = """<!doctype html>
 </style>
 </head><body>
 <h1>Harness M64</h1>
-<div id="thread"></div>
+<div id="thread"
+     hx-get="/api/chat"
+     hx-trigger="load"
+     hx-swap="innerHTML"></div>
 <form hx-post="/api/prompt"
       hx-target="#thread"
       hx-swap="beforeend"
@@ -114,6 +117,15 @@ def build_app(core: "CoreAPI") -> FastAPI:
             {"id": s.id, "prompt": s.prompt, "status": s.status, "created_at": s.created_at}
             for s in core.list_sessions()
         ]
+
+    @app.get("/api/chat", response_class=HTMLResponse)
+    async def chat_history():
+        """Render the persistent chat thread as HTML for HTMX to inject on load."""
+        parts: list[str] = []
+        for m in core.get_chat_history():
+            cls = "user" if m.role == "user" else "agent"
+            parts.append(f'<div class="msg {cls}">{_esc(m.content)}</div>')
+        return "".join(parts)
 
     return app
 

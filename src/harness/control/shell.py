@@ -109,12 +109,31 @@ async def _emergency_stop(s: _Session) -> None:
     await s.line("ok, emergency stop")
 
 
+async def _reset_chat(s: _Session) -> None:
+    info = await s.core.reset(scope="chat")
+    await s.line(f"ok, cleared {info.get('chat_messages_dropped', 0)} chat messages")
+    for p in info.get("paths") or []:
+        await s.line(f"  removed: {p}")
+
+
+async def _reset_all(s: _Session) -> None:
+    info = await s.core.reset(scope="all")
+    await s.line(
+        f"ok, factory reset complete "
+        f"(dropped {info.get('chat_messages_dropped', 0)} chat messages)"
+    )
+    for p in info.get("paths") or []:
+        await s.line(f"  removed: {p}")
+    await s.line("note: memory/level_*.md and tools/ are NOT touched.")
+
+
 async def _help(s: _Session) -> None:
     await s.line("commands:")
     await s.line("  show {status,version,tools,sessions,config}")
     await s.line("  restart")
     await s.line("  stop")
     await s.line("  emergency stop")
+    await s.line("  reset {chat,all}")
     await s.line("  exit | quit")
     await s.line("  ? | help")
 
@@ -131,6 +150,10 @@ _TREE: Dict[str, object] = {
     "restart": _restart,
     "stop": _stop,
     "emergency": {"stop": _emergency_stop},
+    "reset": {
+        "chat": _reset_chat,
+        "all":  _reset_all,
+    },
     "help": _help,
     "?": _help,
 }

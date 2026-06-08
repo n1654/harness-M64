@@ -80,18 +80,32 @@ class Agent:
 
     # ---- single-prompt cycle (multi-round) ----
 
-    async def handle(self, session_id: str, prompt: str) -> str:
-        """Run prompt -> [tool calls...] -> final response. Returns assistant content."""
+    async def handle(
+        self,
+        session_id: str,
+        prompt: str,
+        *,
+        history: Optional[List[Any]] = None,
+    ) -> str:
+        """Run prompt -> [tool calls...] -> final response. Returns assistant content.
+
+        `history` is a list of `ChatMessage`-shaped objects (role + content) -- prior
+        user/assistant turns that give the model conversational memory. Tool-call
+        history of *previous* prompts is NOT included; only the final assistant
+        replies, mirroring what the user sees in the UI thread.
+        """
         if not self._running or self._llm is None or self._memory is None or self._tools is None:
             raise RuntimeError("agent is not started")
 
         max_rounds = self._read_max_rounds()
         round_started = time.time()
         await self._bus.publish(
-            "agent_round_start", session_id=session_id, prompt_len=len(prompt),
+            "agent_round_start",
+            session_id=session_id, prompt_len=len(prompt),
+            history_len=len(history or []),
         )
 
-        messages = self._build_messages(prompt)
+        messages = self._build_messages(prompt, history=history)
         tool_schemas = self._tools.schemas()
         model = getattr(self._llm, "_default_model", "?")
 
@@ -218,8 +232,10 @@ class Agent:
         )
         return str(result_text)
 
-    def _build_messages(self, prompt: str) -> List[Message]:
-        """Assemble the LLM message list from memory layers + the user prompt."""
+    def _build_messages(
+        self, prompt: str, *, history: Optional[List[Any]] = None,
+    ) -> List[Message]:
+        """Assemble the LLM message list: system layers + prior chat + new prompt."""
         assert self._memory is not None
         levels = self._memory.read_levels()
         parts: List[str] = []
@@ -233,6 +249,11 @@ class Agent:
         msgs: List[Message] = []
         if system_text:
             msgs.append(Message(role="system", content=system_text))
+        for h in (history or []):
+            role = getattr(h, "role", None) or (h.get("role") if isinstance(h, dict) else None)
+            content = getattr(h, "content", None) or (h.get("content") if isinstance(h, dict) else None)
+            if role in ("user", "assistant") and content:
+                msgs.append(Message(role=role, content=content))
         msgs.append(Message(role="user", content=prompt))
         return msgs
 
