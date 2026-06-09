@@ -245,25 +245,37 @@ class CoreAPI:
     async def reset(self, scope: str = "chat") -> Dict[str, Any]:
         """Wipe ephemeral state. `scope`:
 
-            'chat'  -- only the visible chat thread (state/chat.jsonl + in-memory).
-            'all'   -- chat + agent scratchpad + knowledge + episodes + state files.
-                       Operator-managed files (memory/level_*.md, tools/) are NEVER touched.
+            'chat'    -- only the visible chat thread (state/chat.jsonl + in-memory).
+            'metrics' -- only the monitor counters + task history (via bus event).
+                         Doesn't touch chat or memory.
+            'all'     -- chat + metrics + agent scratchpad + knowledge + episodes + state files.
+                         Operator-managed files (memory/level_*.md, tools/) are NEVER touched.
 
         Returns a dict describing what was removed.
         """
         scope = (scope or "chat").strip().lower()
-        if scope not in ("chat", "all"):
-            raise ValueError(f"unknown reset scope: {scope!r} (expected 'chat' or 'all')")
+        if scope not in ("chat", "metrics", "all"):
+            raise ValueError(
+                f"unknown reset scope: {scope!r} (expected 'chat', 'metrics' or 'all')"
+            )
 
         removed: Dict[str, Any] = {"scope": scope, "paths": []}
 
-        async with self._chat_lock:
-            n = len(self._chat_history)
-            self._chat_history = []
-            if self._chat_log_path.exists():
-                self._chat_log_path.unlink()
-                removed["paths"].append(str(self._chat_log_path))
-            removed["chat_messages_dropped"] = n
+        if scope in ("chat", "all"):
+            async with self._chat_lock:
+                n = len(self._chat_history)
+                self._chat_history = []
+                if self._chat_log_path.exists():
+                    self._chat_log_path.unlink()
+                    removed["paths"].append(str(self._chat_log_path))
+                removed["chat_messages_dropped"] = n
+        else:
+            removed["chat_messages_dropped"] = 0
+
+        if scope in ("metrics", "all"):
+            # The monitor server subscribes to `factory_reset` and clears its
+            # in-memory counters + task history when it arrives.
+            removed["metrics_cleared"] = True
 
         if scope == "all":
             # Wipe agent-writable memory subtrees (level_*.md NOT touched).

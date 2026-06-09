@@ -8,6 +8,7 @@ Design phase. See [docs/architecture/](docs/architecture/) for C4 diagrams.
 
 ## Design principles
 
+- **Model decides, code reacts** — there is no planner in code. The LLM is both planner and executor: at each round it sees the full chat history and chooses one next step (call a tool, or reply to the user). The agent loop just dispatches the decision and feeds the result back; the chain terminates the moment the model responds without `function_call`. Code holds only safety nets — `HARNESS_MAX_ROUNDS`, per-tool error containment, sandboxed filesystem access. Wire walkthrough: [docs/architecture/multi-tool-chain.puml](docs/architecture/multi-tool-chain.puml).
 - **Observability & scaling** — every tool call and LLM round is an event; metrics are first-class.
 - **From simple to complex** — start with single-process, file-backed; add concurrency, persistent stores, distributed bus when actually needed.
 - **Loose coupling, high cohesion** — LLM adapter, memory store, tool registry all behind small interfaces; each unit owns its data and exposes only verbs.
@@ -17,7 +18,7 @@ Design phase. See [docs/architecture/](docs/architecture/) for C4 diagrams.
 | Port | Surface | Protocol | Purpose |
 |------|---------|----------|---------|
 | 8080 | UI | HTTP + SSE | HTMX-based web chat. Submit prompts, stream agent response, view recent episodes. |
-| 9090 | Monitoring | HTTP | `/metrics` (Prometheus exporter), `/process-map` (Mermaid graph rendered client-side) |
+| 9090 | Monitoring | HTTP | `/metrics` (Prometheus exporter), `/process-map` (live dashboard: counters, FSM state, task history) |
 | 7000 | Control | line-based TCP | Interactive Cisco/Juniper-style shell: `show status / tools / sessions`, `restart`, `stop`, `emergency stop`, `?` |
 
 All three surfaces are thin clients of the same in-process **Core API**. Splitting by port (not URL prefix) lets the operator firewall each independently. The Core API is the only contract between clients and the agent — agent runs even with all three surfaces disabled.
@@ -102,11 +103,17 @@ Wire-format quirks of GigaChat function-calling (vs OpenAI tools) are documented
 
 ```
 harness> reset chat         # wipe only the chat thread (state/chat.jsonl)
-harness> reset all          # wipe chat + scratchpad + knowledge + episodes + state
+harness> reset metrics      # wipe monitor counters + task history (UI + Prometheus)
+harness> reset all          # wipe chat + metrics + scratchpad + knowledge + episodes + state
 harness> show queue         # peek at pending in-flight prompts
 ```
 
 `reset all` never touches `memory/level_*.md` or operator-supplied `tools/` — only agent-writable areas.
+
+**Process map dashboard** at `http://127.0.0.1:9090/process-map`:
+- **Counters** — `prompts`, `rounds ok/fail`, `llm calls`, `tool calls`, tokens in/out, last LLM latency. Reset only via `reset metrics` / `reset all`.
+- **FSM strip** — `idle → prompted → llm ↔ tool → reply`, current state highlighted in orange; under it, the active tool name / model when relevant.
+- **Task history** — per-prompt cards with status (running/done/failed), duration, total tokens. Each card shows the step chain: `user → llm → now → llm → reply` (graphical pills for ≤ 10 steps, text list above that). Updates are scroll-safe — only small DOM leaves change.
 
 ## Built-in tools
 
@@ -157,6 +164,12 @@ After `docker compose up -d`, open `http://127.0.0.1:8080/` and feed the agent t
 | `read_url` hard cap | 100 000 chars | `_HARD_MAX_CHARS` в [web.py](src/harness/tools/web.py) |
 | `read_url` timeout | 20 сек | `_TIMEOUT_SEC` |
 | Knowledge topic slug | до 64 символов, `[a-zA-Z0-9_-]` | regex в [knowledge.py](src/harness/tools/knowledge.py) |
+
+### Multi-tool chains
+
+The agent can call tools **sequentially** in one prompt — e.g. «создай notes.txt и запиши туда текущее время» triggers `now` → `file_write` → final reply. The chain length is capped by `HARNESS_MAX_ROUNDS` (default 8).
+
+Mechanism: `functions[]` is re-sent on **every** round, not just the first. Without it the model has no tool schemas in scope after the first result and can only emit text. Full wire-format walkthrough in [docs/architecture/multi-tool-chain.puml](docs/architecture/multi-tool-chain.puml); per-round invariants in [docs/gigachat-functions.md](docs/gigachat-functions.md).
 
 ## Roadmap
 

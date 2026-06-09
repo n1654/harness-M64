@@ -1,17 +1,21 @@
 # GigaChat functions — заметки по wire-формату
 
 Короткая шпаргалка по тому, как GigaChat v1 ведёт цепочку function-calling
-(на примере OpenAI-compat прокси). Собрано через прогон
-[scripts/probe_gigachat.sh](../scripts/probe_gigachat.sh).
+(на примере OpenAI-compat прокси). Собрано через прогоны
+[scripts/probe_gigachat.sh](../scripts/probe_gigachat.sh) и
+[scripts/multi_tool_probe.sh](../scripts/multi_tool_probe.sh).
+
+Полный временной поток с двумя последовательными tool-вызовами — в
+[docs/architecture/multi-tool-chain.puml](architecture/multi-tool-chain.puml).
 
 ## Инварианты payload'а
 
 | Что | Round 1 | Round 2+ |
 |---|---|---|
-| `functions[]` | **отправляется** | не отправляется |
-| `function_call: "auto"` | отправляется | не отправляется |
-| `messages` | `[system, user]` | `[system, user, assistant(function_call), function(result)]` |
-| `functions_state_id` | в ответе сервера | **нигде не отправляем обратно** (кладём в логи) |
+| `functions[]` | **отправляется** | **отправляется** (без этого второй вызов невозможен — модель не видит схем тулов) |
+| `function_call: "auto"` | отправляется | не задаётся (server сам решает; явный `tool_choice` от caller'а перебивает) |
+| `messages` | `[system, user]` | `[system, user, assistant(function_call), function(result), …]` (полная история всех tool-пар) |
+| `functions_state_id` | в ответе сервера | **нигде не отправляем обратно** (кладём в provider_meta) |
 | `content` у assistant с `function_call` | — | `""` (пустая строка, не `null` и не пропуск) |
 | `function_call.arguments` | — | **JSON-объект**, не строка |
 | `content` у function-result | — | **JSON-valid строка** (текст оборачиваем в `json.dumps`) |

@@ -19,6 +19,17 @@ log = logging.getLogger("harness.monitor.metrics")
 
 class MetricsSink:
     def __init__(self) -> None:
+        self._init_collectors()
+
+    def reset(self) -> None:
+        """Drop the registry and recreate all collectors (counters back to 0).
+
+        Prometheus counters are normally monotonic; the operator explicitly
+        opts into a reset via the control shell.
+        """
+        self._init_collectors()
+
+    def _init_collectors(self) -> None:
         self.registry = CollectorRegistry()
 
         self.prompts = Counter(
@@ -74,6 +85,10 @@ class MetricsSink:
         kind = evt.kind
         d = evt.data
         try:
+            if kind == "factory_reset":
+                if (d.get("scope") or "all") in ("metrics", "all"):
+                    self.reset()
+                return
             if kind == "prompt_submitted":
                 self.prompts.inc()
                 self.active_sessions.inc()

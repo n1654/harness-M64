@@ -1,0 +1,128 @@
+@startuml multi-tool-chain
+title GigaChat multi-tool chain -- wire payload per round
+
+actor       "User"                          as user
+participant "UI / CoreAPI"                  as core
+participant "Agent\nloop"                   as agent
+participant "GigaChat\nadapter"             as adapter
+participant "Local\ntools"                  as tools
+participant "GigaChat\n/chat/completions"   as api
+
+== How the loop works ==
+
+note over agent, api
+  Each **round** = one POST to /chat/completions, plus
+  (if the response asks for it) one tool execution.
+
+  **Continue** the loop while the response contains `function_call`
+    (means: the model still wants a tool result before answering).
+
+  **Exit** the loop the moment the response is plain `content`
+    with **`function_call` absent** -- the model is done deciding,
+    `content` is the final answer for the user.
+
+  Rounds = (number of tool calls made by the model) + 1.
+  Example below has 2 tool calls -> 3 rounds.
+  Hard ceiling: HARNESS_MAX_ROUNDS (default 8).
+end note
+
+== Start ==
+
+user -> core   : «Создай notes.txt и\nзапиши туда текущее время»
+core -> agent  : handle(prompt, history=[])
+
+== Round 1 -- no tool results yet, model must pick a first tool ==
+
+agent -> adapter : chat(messages, tools=[now, file_write, ...])
+
+note over adapter, api
+  **HTTP request**:
+    messages        : [system, user]
+    functions[]     : [now, file_write, ...]
+    function_call   : "auto"
+    profanity_check : true
+end note
+
+adapter -> api   : POST /chat/completions
+api --> adapter  : 200 OK
+
+note left of api #FFE0B2
+  **response  ->  CONTINUE loop**
+    assistant.content       : ""
+    assistant.function_call : { name: "now",
+                                arguments: { "format": "human" } }
+    functions_state_id      : "<X>"
+end note
+
+adapter --> agent : Message(tool_calls=[{name:"now", ...}])
+
+agent -> tools    : execute("now", {format:"human"})
+tools --> agent   : "2026-06-09 10:42:00 UTC"
+
+agent -> agent    : history.append(\n   assistant(function_call=now, content=""),\n   function(name="now",\n            content="\"2026-06-09 10:42:00 UTC\"")\n)
+
+== Round 2 -- model saw `now` result, now needs to act on it ==
+
+agent -> adapter  : chat(messages, tools=[now, file_write, ...])
+
+note over adapter, api
+  **HTTP request**:
+    messages         : [system, user,
+                        assistant(function_call=now, content=""),
+                        function(name="now",
+                                 content="\"2026-06-09 10:42:00 UTC\"")]
+    functions[]      : [now, file_write, ...]
+end note
+
+adapter -> api    : POST /chat/completions
+api --> adapter   : 200 OK
+
+note left of api #FFE0B2
+  **response  ->  CONTINUE loop**
+    assistant.function_call : { name: "file_write",
+                                arguments: { "path": "notes.txt",
+                                             "content": "2026-06-09 ..." } }
+end note
+
+adapter --> agent : Message(tool_calls=[{name:"file_write", ...}])
+
+agent -> tools    : execute("file_write", {path, content})
+tools --> agent   : "ok, wrote 26 chars to notes.txt"
+
+agent -> agent    : history.append(\n   assistant(function_call=file_write),\n   function(name="file_write",\n            content="\"ok, wrote ...\"")\n)
+
+== Round 3 -- model saw BOTH tool results, has everything it needs ==
+
+agent -> adapter  : chat(messages, tools=[now, file_write, ...])
+
+note over adapter, api
+  **HTTP request** -- history now carries BOTH tool-call pairs:
+    messages     : [system, user,
+                    asst(fc=now),        function(now-result),
+                    asst(fc=file_write), function(file_write-result)]
+    functions[]  : [now, file_write, ...]
+end note
+
+adapter -> api    : POST /chat/completions
+api --> adapter   : 200 OK
+
+note left of api #A5D6A7
+  **response  ->  EXIT loop**   (function_call is ABSENT)
+    assistant.content       : "Готово, создал notes.txt с текущим
+                              временем 2026-06-09 10:42:00 UTC."
+    assistant.function_call : —
+end note
+
+adapter --> agent : Message(content="...", tool_calls=[])
+
+== End ==
+
+note right of agent #A5D6A7
+  No function_call in response -> loop exits.
+  Final content returned to caller.
+end note
+
+agent --> core    : final content
+core --> user     : chat thread updated\n(SSE chunk + history append in state/chat.jsonl)
+
+@enduml

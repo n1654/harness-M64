@@ -298,27 +298,24 @@ class GigaChatClient(LLMClient):
                 # OpenAI-compatible proxies expect this shape on every turn.
                 payload["tools"] = [_to_openai_tool(t) for t in tools]
                 payload["tool_choice"] = tool_choice if tool_choice is not None else "auto"
-            elif not has_function_result:
-                # GigaChat v1 quirk: `functions[]` + `function_call` are only
-                # valid on the FIRST request of a function-calling chain.
-                # Re-sending them together with an assistant-function_call +
-                # function-result pair in `messages[]` triggers 422
-                # "INVALID_PARAMS: functions ... should only appear in user,
-                # function messages or random role messages".
-                #
-                # On follow-up turns we must keep BOTH the assistant turn AND
-                # the function-result in `messages[]` (otherwise the server
-                # complains: "every assistant function call must have a result
-                # in history") -- but omit the top-level `functions[]` /
-                # `function_call`. The chain is resumed via `functions_state_id`
-                # already echoed on the messages themselves.
+            else:
+                # GigaChat v1: `functions[]` is re-sent on EVERY round so the
+                # model can chain another function call after seeing a tool
+                # result. Without it the second-round LLM has no schema in
+                # scope and can only emit text -- which kills multi-tool flows
+                # like "get time, then write it to a file".
                 payload["functions"] = [_to_giga_function(t) for t in tools]
-                payload["function_call"] = tool_choice if tool_choice is not None else "auto"
-            elif tool_choice is not None:
-                # Even on follow-up rounds, an EXPLICIT tool_choice override is
-                # honoured -- e.g. "none" to force a text-only finalisation
-                # summary, or {"name": "X"} for structured extraction.
-                payload["function_call"] = tool_choice
+                if not has_function_result:
+                    # First round of the chain -- explicit "auto" (mirrors the
+                    # working curl from the Sber docs).
+                    payload["function_call"] = tool_choice if tool_choice is not None else "auto"
+                elif tool_choice is not None:
+                    # Follow-up rounds: don't force `function_call:auto` by
+                    # default (early server validation was picky about that
+                    # combo). Still honour an EXPLICIT tool_choice from caller
+                    # -- e.g. "none" for a text-only finalisation summary, or
+                    # {"name": "X"} for structured extraction.
+                    payload["function_call"] = tool_choice
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
 

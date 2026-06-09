@@ -127,6 +127,11 @@ async def _reset_chat(s: _Session) -> None:
         await s.line(f"  removed: {p}")
 
 
+async def _reset_metrics(s: _Session) -> None:
+    await s.core.reset(scope="metrics")
+    await s.line("ok, metrics counters + task history cleared")
+
+
 async def _reset_all(s: _Session) -> None:
     info = await s.core.reset(scope="all")
     await s.line(
@@ -144,7 +149,7 @@ async def _help(s: _Session) -> None:
     await s.line("  restart")
     await s.line("  stop")
     await s.line("  emergency stop")
-    await s.line("  reset {chat,all}")
+    await s.line("  reset {chat,metrics,all}")
     await s.line("  exit | quit")
     await s.line("  ? | help")
 
@@ -163,8 +168,9 @@ _TREE: Dict[str, object] = {
     "stop": _stop,
     "emergency": {"stop": _emergency_stop},
     "reset": {
-        "chat": _reset_chat,
-        "all":  _reset_all,
+        "chat":    _reset_chat,
+        "metrics": _reset_metrics,
+        "all":     _reset_all,
     },
     "help": _help,
     "?": _help,
