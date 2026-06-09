@@ -16,13 +16,31 @@ import importlib.util
 import logging
 import pathlib
 import pkgutil
-from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from harness.bus import EventBus
+    from harness.memory.base import MemoryStore
 
 log = logging.getLogger("harness.tools.registry")
 
 
-ToolHandler = Callable[[Dict[str, Any]], Awaitable[str]]
+@dataclass
+class ToolContext:
+    """Runtime context passed to every tool handler.
+
+    Tools that don't need it (e.g. pure-compute like `now`, `echo`) ignore it.
+    Tools that touch memory, the bus, or sandboxed files take what they need.
+    """
+
+    memory: "MemoryStore"
+    state_dir: pathlib.Path
+    bus: "EventBus"
+    extras: Dict[str, Any] = field(default_factory=dict)
+
+
+ToolHandler = Callable[[ToolContext, Dict[str, Any]], Awaitable[str]]
 
 
 @dataclass
@@ -34,11 +52,20 @@ class ToolEntry:
 
 
 class ToolRegistry:
-    def __init__(self, tools_dir: pathlib.Path) -> None:
+    def __init__(
+        self,
+        tools_dir: pathlib.Path,
+        *,
+        ctx: Optional[ToolContext] = None,
+    ) -> None:
         self._entries: Dict[str, ToolEntry] = {}
         self._tools_dir = pathlib.Path(tools_dir)
+        self._ctx = ctx
         self._discover_bundled()
         self._discover_external()
+
+    def set_context(self, ctx: ToolContext) -> None:
+        self._ctx = ctx
 
     # ---- discovery ----
 
@@ -94,4 +121,6 @@ class ToolRegistry:
         entry = self._entries.get(name)
         if entry is None:
             return f"⚠️ unknown tool: {name}. available: {', '.join(self.names())}"
-        return await entry.handler(args)
+        if self._ctx is None:
+            return f"⚠️ tool context not initialised; cannot execute {name}"
+        return await entry.handler(self._ctx, args)

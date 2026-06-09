@@ -274,6 +274,7 @@ class GigaChatClient(LLMClient):
         tools: Optional[List[Dict[str, Any]]] = None,
         model: Optional[str] = None,
         max_tokens: Optional[int] = None,
+        tool_choice: Optional[Any] = None,
     ) -> CompletionResult:
         token = await self._ensure_token()
 
@@ -296,7 +297,7 @@ class GigaChatClient(LLMClient):
             if self._tool_format == "tools":
                 # OpenAI-compatible proxies expect this shape on every turn.
                 payload["tools"] = [_to_openai_tool(t) for t in tools]
-                payload["tool_choice"] = "auto"
+                payload["tool_choice"] = tool_choice if tool_choice is not None else "auto"
             elif not has_function_result:
                 # GigaChat v1 quirk: `functions[]` + `function_call` are only
                 # valid on the FIRST request of a function-calling chain.
@@ -312,7 +313,12 @@ class GigaChatClient(LLMClient):
                 # `function_call`. The chain is resumed via `functions_state_id`
                 # already echoed on the messages themselves.
                 payload["functions"] = [_to_giga_function(t) for t in tools]
-                payload["function_call"] = "auto"
+                payload["function_call"] = tool_choice if tool_choice is not None else "auto"
+            elif tool_choice is not None:
+                # Even on follow-up rounds, an EXPLICIT tool_choice override is
+                # honoured -- e.g. "none" to force a text-only finalisation
+                # summary, or {"name": "X"} for structured extraction.
+                payload["function_call"] = tool_choice
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
 

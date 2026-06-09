@@ -61,6 +61,39 @@
    `functions or thinking_functions should only appeal in user, function messages or random role messages`.
 3. **`content` результата = JSON-valid строка**, не сырое сообщение от инструмента.
 
+## Поведение `function_call` — что подтверждено на практике
+
+Замеры на `GigaChat-3-Ultra` с tool `calculate` и промптом «Посчитай 2 + 3 * 4»
+(скрипт [scripts/function_call_probe.sh](../scripts/function_call_probe.sh)):
+
+| Вариант | Что вернула модель | `finish_reason` |
+|---|---|---|
+| 1. поле `function_call` **отсутствует** | `function_call(calculate, "2 + 3 * 4")` | `function_call` |
+| 2. `function_call: "auto"` | `function_call(calculate, "2 + 3 * 4")` | `function_call` |
+| 3. `function_call: "none"` | текст: «равен 14, потому что 3×4=12...» | `stop` |
+| 4. `function_call: {"name": "calculate"}` | принудительный вызов `calculate` | `function_call` |
+
+**Главные выводы:**
+- При наличии `functions[]` варианты 1 и 2 эквивалентны — дефолт = `"auto"`.
+- `"none"` строго запрещает вызов: модель **сама считает математику в LaTeX'е**
+  вместо использования очевидно полезного инструмента.
+- Принудительный вызов (`{"name": ...}`) работает даже на нерелевантном промпте.
+
+## Как это применять в коде
+
+`LLMClient.chat()` принимает параметр `tool_choice`, который адаптер
+переводит в `function_call` (legacy GigaChat) или `tool_choice` (OpenAI-shape).
+
+| Когда нужно | `tool_choice=` | Где может пригодиться |
+|---|---|---|
+| Обычный tool-loop, дать модели свободу | `None` (default) или `"auto"` | round 1 в `agent.handle()` — то, что есть сейчас |
+| Финальный «суммирующий» проход — текст обязательно | `"none"` | если агент знает, что больше tool-данных не нужно, и не хочет случайного нового вызова |
+| Structured extraction — JSON по схеме конкретной функции | `{"name": "extract_foo"}` | guards, validators, парсинг неструктурированного ввода |
+
+Адаптер также сам корректно гасит `function_call` на round 2+ цепочки
+(см. квирки выше), но **явный** `tool_choice` всегда перебивает дефолт — например,
+`"none"` поедет в payload даже на втором round'е, если попросишь.
+
 ## Где это в коде
 
 * [src/harness/llm/gigachat.py](../src/harness/llm/gigachat.py)

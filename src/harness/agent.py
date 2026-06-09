@@ -51,11 +51,12 @@ class Agent:
     async def start(self) -> None:
         from harness.llm.gigachat import GigaChatClient
         from harness.memory.files import FileMemoryStore
-        from harness.tools.registry import ToolRegistry
+        from harness.tools.registry import ToolContext, ToolRegistry
 
         self._llm = GigaChatClient.from_env()
         self._memory = FileMemoryStore(self._memory_dir)
-        self._tools = ToolRegistry(self._tools_dir)
+        ctx = ToolContext(memory=self._memory, state_dir=self._state_dir, bus=self._bus)
+        self._tools = ToolRegistry(self._tools_dir, ctx=ctx)
         self._running = True
         log.info("agent started; tools=%s", self._tools.names())
 

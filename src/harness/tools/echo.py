@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from harness.tools.registry import ToolEntry
+from harness.tools.registry import ToolContext, ToolEntry
 
 
-async def _echo(args: Dict[str, Any]) -> str:
+async def _echo(ctx: ToolContext, args: Dict[str, Any]) -> str:
     return str(args.get("text", ""))
 
 

@@ -108,6 +108,56 @@ harness> show queue         # peek at pending in-flight prompts
 
 `reset all` never touches `memory/level_*.md` or operator-supplied `tools/` — only agent-writable areas.
 
+## Built-in tools
+
+The agent ships with 9 tools, auto-discovered at startup. Drop a `.py` file into `tools/` to add more (see [tools/README.md](tools/README.md)).
+
+| Tool | Scope | What it does |
+|---|---|---|
+| `echo` | — | returns its input verbatim (smoke target) |
+| `now` | — | current UTC time in `iso` / `epoch` / `human` formats |
+| `knowledge_write` | `memory/knowledge/<topic>.md` | save a long-term fact under a topic slug |
+| `knowledge_read` | `memory/knowledge/<topic>.md` | read it back |
+| `knowledge_list` | `memory/knowledge/` | enumerate known topics |
+| `read_url` | open web | HTTP GET, strips HTML by default, capped at 20K chars (hard cap 100K) |
+| `file_write` | `state/sandbox/` | write a UTF-8 file inside the agent's sandbox (max 200KB) |
+| `file_read`  | `state/sandbox/` | read a file from the sandbox |
+| `file_list`  | `state/sandbox/` | recursively list files in the sandbox |
+
+`file_*` paths are relative; absolute paths and `..`-traversals are refused. `knowledge_*` topic slugs must match `[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}` (no slashes, no spaces).
+
+### Try it
+
+After `docker compose up -d`, open `http://127.0.0.1:8080/` and feed the agent these prompts. The expected effect is described in the «Check» column.
+
+| Prompt | Expected agent action | Check |
+|---|---|---|
+| «Меня зовут <имя>, запомни это» | calls `knowledge_write(topic="user", content="...")` | `cat ~/harness-M64/memory/knowledge/user.md` |
+| «Как меня зовут?» (новый сеанс / после reset chat) | calls `knowledge_list` → `knowledge_read(topic="user")`, отвечает имя | `docker compose logs harness \| grep -E 'tool_call_(start\|end)'` |
+| «Открой example.com и кратко расскажи, что там» | calls `read_url(url="https://example.com/")` | в логах `tool_call_start name=read_url`; узел `read_url` оранжевый на `/process-map` |
+| «Сохрани в файл `notes.md` план статьи о ...» | calls `file_write(path="notes.md", content="...")` | `ls ~/harness-M64/state/sandbox/`, `cat ~/harness-M64/state/sandbox/notes.md` |
+| «Какое сейчас время по Москве?» | calls `now(format="iso")`, конвертирует ответ | в логах `tool_call_end name=now ok=True latency_sec=0.001` |
+
+### Where to look when something goes wrong
+
+- **Логи**: `docker compose logs -f harness` — видны все события шины (`prompt_submitted → agent_round_start → tool_call_* → llm_call_* → agent_round_end`).
+- **Метрики**: `curl -s http://127.0.0.1:9090/metrics | grep harness_tool_calls_total` — счётчики по каждому tool×outcome.
+- **Process map**: `http://127.0.0.1:9090/process-map` — карточки и Mermaid с активными узлами в реальном времени.
+- **Чат**: `cat ~/harness-M64/state/chat.jsonl` — полная история user/assistant turns.
+- **Эпизоды**: `~/harness-M64/memory/episodes/<YYYY-MM-DD>.jsonl` — детальные записи каждого round'а с latency и usage.
+- **Очередь**: `nc localhost 7000` → `show queue` — pending tasks (если что-то зависло).
+
+### Hard limits
+
+| Что | Лимит | Где меняется |
+|---|---|---|
+| `file_read` / `file_write` | 200 KB | `_MAX_READ_BYTES` / `_MAX_WRITE_BYTES` в [files.py](src/harness/tools/files.py) |
+| `file_list` | 500 записей | `_MAX_LIST_ITEMS` там же |
+| `read_url` default | 20 000 chars | параметр `max_chars` запроса |
+| `read_url` hard cap | 100 000 chars | `_HARD_MAX_CHARS` в [web.py](src/harness/tools/web.py) |
+| `read_url` timeout | 20 сек | `_TIMEOUT_SEC` |
+| Knowledge topic slug | до 64 символов, `[a-zA-Z0-9_-]` | regex в [knowledge.py](src/harness/tools/knowledge.py) |
+
 ## Roadmap
 
 1. **Architecture** ← we are here. C4 diagrams in [docs/architecture/](docs/architecture/).

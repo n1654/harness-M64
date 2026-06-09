@@ -53,6 +53,15 @@ class LLMClient(Protocol):
         tools: Optional[List[Dict[str, Any]]] = None,
         model: Optional[str] = None,
         max_tokens: Optional[int] = None,
+        tool_choice: Optional[Any] = None,
     ) -> CompletionResult:
-        """One chat completion turn. May or may not return `tool_calls`."""
+        """One chat completion turn. May or may not return `tool_calls`.
+
+        `tool_choice` controls how the model interacts with `tools`:
+            * None (default)        -- adapter picks the sensible default
+                                       (usually equivalent to "auto").
+            * "auto"                -- model decides whether to call a tool.
+            * "none"                -- model is forbidden from calling tools.
+            * {"name": "<tool>"}    -- model is forced to call this tool.
+        """
         ...

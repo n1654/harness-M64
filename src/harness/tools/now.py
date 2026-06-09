@@ -6,10 +6,10 @@ from __future__ import annotations
 import datetime
 from typing import Any, Dict, List
 
-from harness.tools.registry import ToolEntry
+from harness.tools.registry import ToolContext, ToolEntry
 
 
-async def _now(args: Dict[str, Any]) -> str:
+async def _now(ctx: ToolContext, args: Dict[str, Any]) -> str:
     fmt = str(args.get("format") or "iso").strip().lower()
     now = datetime.datetime.now(datetime.timezone.utc)
     if fmt == "epoch":
