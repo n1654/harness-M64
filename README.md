@@ -2,9 +2,41 @@
 
 Self-driving LLM agent runtime. Single Docker container, three TCP interfaces.
 
-## Status
+## Quickstart
 
-Design phase. See [docs/architecture/](docs/architecture/) for C4 diagrams.
+```bash
+git clone <this-repo> harness-M64 && cd harness-M64
+
+cp .env.example .env
+# Edit .env: set GIGACHAT_AUTH_KEY (base64 of client_id:client_secret).
+# Override GIGACHAT_CHAT_URL if you talk through a proxy.
+
+docker compose up -d --build
+docker compose logs -f harness     # watch boot + bus events
+```
+
+Open in browser:
+- `http://127.0.0.1:8080/` — chat with the agent
+- `http://127.0.0.1:9090/process-map` — live dashboard (counters, FSM, task history)
+- `http://127.0.0.1:9090/metrics` — Prometheus exporter
+
+Control shell (ops commands):
+```bash
+nc 127.0.0.1 7000        # then type:  show status | reset chat | reset all | ?
+```
+
+Smoke-test the LLM adapter without the UI:
+```bash
+docker compose exec -T harness python -m harness.smoke "ping"
+```
+
+Smoke-test a single tool without the agent:
+```bash
+docker compose exec -T harness python -m harness.tools_cli echo '{"text":"hi"}'
+docker compose exec -T harness python -m harness.tools_cli --list
+```
+
+See [Built-in tools](#built-in-tools) for what the agent can do, [Runtime behavior](#runtime-behavior) for chat memory / queue / reset semantics, [LLM adapter — GigaChat](#llm-adapter--gigachat) for auth-mode / mTLS / proxy details.
 
 ## Design principles
 
@@ -173,19 +205,19 @@ Mechanism: `functions[]` is re-sent on **every** round, not just the first. With
 
 ## Roadmap
 
-1. **Architecture** ← we are here. C4 diagrams in [docs/architecture/](docs/architecture/).
-2. Skeleton: directory layout, ports, three empty HTTP servers, Dockerfile + compose.
-3. LLM adapter: GigaChat OAuth + chat completions behind `LLMClient` interface.
-4. Memory store: interface + file-based implementation.
-5. Tool registry + 1–2 example tools (echo, datetime).
-6. Agent loop: single round → multi-round with tool calls.
-7. UI server: minimal web for chat (HTMX or vanilla), CLI shim.
-8. Monitoring server: Prometheus exporter + process map page.
-9. Control server: lifecycle endpoints.
-10. End-to-end run inside Docker.
+Working today:
 
-## Out of scope
-
-- Telegram integration.
-- Git automation / code review on agent commits — overhead.
-- Self-evolution / `BIBLE.md`-style philosophical machinery. Constitution is just a memory file with rules.
+- C4 architecture + multi-tool wire-flow sequence diagram in [docs/architecture/](docs/architecture/).
+- Skeleton: single Docker container, three independent TCP ports (UI / monitor / control).
+- LLM adapter — GigaChat: OAuth (`credentials` / `mTLS`), full function-calling (incl. multi-tool chains), custom HTTP headers, TLS-insecure flag, `profanity_check`, `tool_choice` (`auto` / `none` / forced).
+- Memory: hierarchical `level_*.md` + scratchpad + knowledge + episodes (file-backed).
+- Tool registry + `ToolContext` injection; auto-discovery of bundled + operator `tools/*.py`.
+- Built-in tools (9): `echo`, `now`, `knowledge_read/write/list`, `read_url`, `file_read/write/list` (sandboxed).
+- Agent loop: multi-round with tool chains, `HARNESS_MAX_ROUNDS` ceiling, episode log per round.
+- Chat thread: multi-turn memory persisted to `state/chat.jsonl`, restored on start.
+- Persistent task queue: in-flight prompts survive container restart, replayed sequentially.
+- Factory reset via control shell — `reset {chat,metrics,all}`. Operator files (`level_*.md`, `tools/`) never touched.
+- UI: HTMX + SSE chat at `:8080`, full thread on load.
+- Monitoring at `:9090`: Prometheus exporter + live dashboard (counters / FSM strip / per-task step chains).
+- Control at `:7000`: line-based shell — `show {status,version,tools,sessions,queue,config}`, `reset`, `restart`, `stop`, `emergency stop`.
+- Stand-alone CLI: `python -m harness.tools_cli` for tool diagnostics, `python -m harness.smoke` for LLM smoke-test.
